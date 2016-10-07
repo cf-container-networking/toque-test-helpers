@@ -1,0 +1,4 @@
+Test Parameters: Apps 80
+Cell Stats: | cell_z1/0 (fe87ee61-7498-4622-bafd-0c12e1c82463)          | running | n/a | cell_z1          | 10.10.5.67 | 2.48, 1.28, 0.65      | 4.7% | 7.5% | 0.6% | 8% (2.3G)    | 0% (0B)    | 44%        | 8%         | n/a        |
+Cell Stats: | cell_z1/0 (fe87ee61-7498-4622-bafd-0c12e1c82463)          | running | n/a | cell_z1          | 10.10.5.67 | 1.49, 1.25, 0.68      | 5.8% | 12.6% | 0.5% | 8% (2.4G)    | 0% (0B)    | 44%        | 9%         | n/a        |
+Cell Stats: | cell_z1/0 (fe87ee61-7498-4622-bafd-0c12e1c82463)          | running | n/a | cell_z1          | 10.10.5.67 | 0.95, 1.13, 0.68      | 4.1% | 8.6% | 0.3% | 8% (2.4G)    | 0% (0B)    | 44%        | 9%         | n/a        |

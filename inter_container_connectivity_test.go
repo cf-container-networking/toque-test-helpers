@@ -1,19 +1,15 @@
 package acceptance_test
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"lib/models"
 	"lib/policy_client"
-	"lib/testsupport"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	"code.cloudfoundry.org/lager/lagertest"
@@ -41,30 +37,19 @@ func isSameCell(sourceIP, destIP string) bool {
 var _ = Describe("connectivity between containers on the overlay network", func() {
 	Describe("networking policy", func() {
 		var (
-			appProxy       string
-			appRegistry    string
-			appsTest       []string
-			orgName        string
-			spaceName      string
-			appInstances   int
-			applications   int
-			proxyInstances int
+			appsTest     []string
+			orgName      string
+			spaceName    string
+			applications int
+			start        int
 		)
 
 		BeforeEach(func() {
-			appInstances = testConfig.AppInstances
 			applications = testConfig.Applications
-			proxyInstances = testConfig.ProxyInstances
+			start = testConfig.StartIndex
 
-			appProxy = fmt.Sprintf("proxy-%d", rand.Int31())
-			appRegistry = fmt.Sprintf("registry-%d", rand.Int31())
-			for i := 0; i < applications; i++ {
-				appsTest = append(appsTest, fmt.Sprintf("tick-%d-%d", i, rand.Int31()))
-			}
-
-			ports = []int{8080}
-			for i := 0; i < testConfig.Policies; i++ {
-				ports = append(ports, 7000+i)
+			for i := start; i < applications+start; i++ {
+				appsTest = append(appsTest, fmt.Sprintf("proxy-%d", i))
 			}
 
 			Auth(testConfig.TestUser, testConfig.TestUserPassword)
@@ -78,73 +63,40 @@ var _ = Describe("connectivity between containers on the overlay network", func(
 			Expect(cf.Cf("target", "-o", orgName, "-s", spaceName).Wait(Timeout_Push)).To(gexec.Exit(0))
 		})
 
-		AfterEach(func() {
-			appReport(appProxy, Timeout_Short)
-			appReport(appRegistry, Timeout_Short)
-			appsReport(appsTest, Timeout_Short)
-
-			// clean up everything
-			Expect(cf.Cf("delete-org", orgName, "-f").Wait(Timeout_Push)).To(gexec.Exit(0))
-		})
-
 		It("allows the user to configure policies", func(done Done) {
-			By("pushing the registry app and proxy app")
-			var setupWG sync.WaitGroup
-			setupWG.Add(2)
-			go func() {
-				defer GinkgoRecover()
-				pushRegistryApp(appRegistry)
-				setupWG.Done()
-			}()
-
-			go func() {
-				defer GinkgoRecover()
-				pushApp(appProxy)
-				scaleApp(appProxy, proxyInstances)
-				setupWG.Done()
-			}()
-			setupWG.Wait()
-
-			By("pushing the tick apps")
-			newManifest := modifyTickManifest(appRegistry)
-			runWithTimeout("push tick apps", 5*time.Minute, func() {
-				pushAppsOfType(appsTest, "tick", newManifest)
+			By("pushing the apps")
+			runWithTimeout("push apps", 5*time.Minute, func() {
+				pushAppsOfType(appsTest, "proxy", defaultManifest("proxy"))
 			})
 
-			By("scaling the tick apps")
-			scaleApps(appsTest, appInstances)
+			policies := []int{4000}
+			for _, nPolicies := range policies {
+				By(fmt.Sprintf("creating %d policies", nPolicies))
+				for i := 0; i < nPolicies; i++ {
+					ports = append(ports, 7000+i)
+				}
+				doAllSelfPolicies("create", appsTest, ports)
 
-			By("checking that all test app instances have registered themselves")
-			checkRegistry(appRegistry, 60*time.Second, 500*time.Millisecond, len(appsTest)*appInstances)
+				stats := fmt.Sprintf("Test Parameters: Apps %d\n", applications+start)
+				By("test set up complete waiting 2 mins")
+				time.Sleep(1 * time.Minute)
+				stats = fmt.Sprintf("%sCell Stats: %s\n", stats, GetVMCPUUsage())
+				time.Sleep(1 * time.Minute)
+				By("1 minute...")
+				stats = fmt.Sprintf("%sCell Stats: %s\n", stats, GetVMCPUUsage())
+				time.Sleep(1 * time.Minute)
+				By("2 minutes...")
+				stats = fmt.Sprintf("%sCell Stats: %s\n", stats, GetVMCPUUsage())
 
-			appIPs := getAppIPs(appRegistry)
+				file, err := os.Create(fmt.Sprintf("stats/toque_test_policy_scaling_%d_policies", nPolicies))
+				Expect(err).NotTo(HaveOccurred())
+				defer file.Close()
+				_, err = file.WriteString(stats)
+				Expect(err).NotTo(HaveOccurred())
 
-			By("checking that the connection fails")
-			runWithTimeout("check connection failures", 5*time.Minute, func() {
-				assertConnectionFails(appProxy, appIPs, ports, proxyInstances)
-			})
-
-			By("creating policies")
-			doAllPolicies("create", appProxy, appsTest, ports)
-
-			By(fmt.Sprintf("checking that %s can reach %s", appProxy, appsTest))
-			runWithTimeout("check connection success", 5*time.Minute, func() {
-				assertConnectionSucceeds(appProxy, appIPs, ports, proxyInstances)
-			})
-
-			dumpStats(appProxy, config.AppsDomain)
-
-			By("deleting policies")
-			doAllPolicies("delete", appProxy, appsTest, ports)
-
-			By(fmt.Sprintf("checking that %s can NOT reach %s", appProxy, appsTest))
-			runWithTimeout("check connection failures, again", 5*time.Minute, func() {
-				assertConnectionFails(appProxy, appIPs, ports, proxyInstances)
-			})
-
-			By("checking that reflex no longer reports deleted instances")
-			scaleApps(appsTest, 1 /* instances */)
-			checkRegistry(appRegistry, 60*time.Second, 500*time.Millisecond, len(appsTest))
+				By(fmt.Sprintf("deleting %d policies", nPolicies))
+				doAllSelfPolicies("delete", appsTest, ports)
+			}
 
 			close(done)
 		}, 30*60 /* <-- overall spec timeout in seconds */)
@@ -161,9 +113,8 @@ func getToken() string {
 	return strings.TrimSpace(strings.TrimPrefix(rawOutput, "bearer "))
 }
 
-func getGuids(sourceAppName string, dstAppNames []string) (string, []string) {
-	dstGuids := []string{}
-	sourceGuid := ""
+func getGuids(appNames []string) []string {
+	guids := []string{}
 	token := getToken()
 	appsClient := rainmaker.NewApplicationsService(rainmaker.Config{Host: "http://" + config.ApiEndpoint})
 
@@ -172,13 +123,9 @@ func getGuids(sourceAppName string, dstAppNames []string) (string, []string) {
 
 	for {
 		for _, app := range appsList.Applications {
-			if app.Name == sourceAppName {
-				sourceGuid = app.GUID
-				continue
-			}
-			for _, tickAppName := range dstAppNames {
-				if app.Name == tickAppName {
-					dstGuids = append(dstGuids, app.GUID)
+			for _, appName := range appNames {
+				if app.Name == appName {
+					guids = append(guids, app.GUID)
 					break
 				}
 			}
@@ -191,24 +138,26 @@ func getGuids(sourceAppName string, dstAppNames []string) (string, []string) {
 		}
 	}
 
-	Expect(sourceGuid).NotTo(BeEmpty())
-	Expect(dstGuids).To(HaveLen(len(dstAppNames)))
+	Expect(guids).To(HaveLen(len(appNames)))
 
-	return sourceGuid, dstGuids
+	return guids
 }
 
-func doAllPolicies(action string, source string, dstList []string, dstPorts []int) {
+func doAllSelfPolicies(action string, apps []string, dstPorts []int) {
+	if len(dstPorts) <= 0 {
+		return
+	}
 	policyClient := policy_client.NewExternal(lagertest.NewTestLogger("test"), &http.Client{}, "http://"+config.ApiEndpoint)
-	sourceGuid, dstGuids := getGuids(source, dstList)
+	guids := getGuids(apps)
 	policies := []models.Policy{}
-	for _, dstGuid := range dstGuids {
+	for _, guid := range guids {
 		for _, port := range dstPorts {
 			policies = append(policies, models.Policy{
 				Source: models.Source{
-					ID: sourceGuid,
+					ID: guid,
 				},
 				Destination: models.Destination{
-					ID:       dstGuid,
+					ID:       guid,
 					Port:     port,
 					Protocol: "tcp",
 				},
@@ -240,104 +189,6 @@ func runWithTimeout(operation string, timeout time.Duration, work func()) {
 	}
 }
 
-func dumpStats(host, domain string) {
-	respBytes, err := httpGetBytes(fmt.Sprintf("http://%s.%s/stats", host, domain))
-	Expect(err).NotTo(HaveOccurred())
-
-	fmt.Printf("STATS: %s\n", string(respBytes))
-	netStatsFile := os.Getenv("NETWORK_STATS_FILE")
-	if netStatsFile != "" {
-		Expect(ioutil.WriteFile(netStatsFile, respBytes, 0600)).To(Succeed())
-	}
-}
-
-type RegistryInstancesResponse struct {
-	Instances []struct {
-		ServiceName string `json:"service_name"`
-		Endpoint    struct {
-			Value string `json:"value"`
-		} `json:"endpoint"`
-	} `json:"instances"`
-}
-
-func getInstancesFromA8(registry string) (*RegistryInstancesResponse, error) {
-	respBytes, err := httpGetBytes(fmt.Sprintf("http://%s.%s/api/v1/instances", registry, config.AppsDomain))
-	if err != nil {
-		return nil, err
-	}
-
-	var instancesResponse RegistryInstancesResponse
-	err = json.Unmarshal(respBytes, &instancesResponse)
-	if err != nil {
-		return nil, err
-	}
-	return &instancesResponse, nil
-}
-
-func checkRegistry(registry string, timeout, pollingInterval time.Duration, totalInstances int) {
-	registeredApps := func() (int, error) {
-		instancesResponse, err := getInstancesFromA8(registry)
-		if err != nil {
-			return 0, err
-		}
-		return len(instancesResponse.Instances), nil
-	}
-
-	Eventually(registeredApps, timeout, pollingInterval).Should(Equal(totalInstances))
-}
-
-func getAppIPs(registry string) []string {
-	instancesResponse, err := getInstancesFromA8(registry)
-	Expect(err).NotTo(HaveOccurred())
-
-	ips := []string{}
-	for _, instance := range instancesResponse.Instances {
-		ip, _, err := net.SplitHostPort(instance.Endpoint.Value)
-		Expect(err).NotTo(HaveOccurred())
-		ips = append(ips, ip)
-	}
-	return ips
-}
-
-func assertConnectionSucceeds(sourceApp string, destApps []string, ports []int, nProxies int) {
-	parallelRunner := &testsupport.ParallelRunner{
-		NumWorkers: 5 * nProxies,
-	}
-	parallelRunner.RunOnSliceStrings(destApps, func(appIP string) {
-		for _, port := range ports {
-			assertSingleConnection(appIP, port, sourceApp, true)
-		}
-	})
-}
-
-func assertConnectionFails(sourceApp string, destApps []string, ports []int, nProxies int) {
-	parallelRunner := &testsupport.ParallelRunner{
-		NumWorkers: 5 * nProxies,
-	}
-	parallelRunner.RunOnSliceStrings(destApps, func(appIP string) {
-		for _, port := range ports {
-			assertSingleConnection(appIP, port, sourceApp, false)
-		}
-	})
-}
-
-func assertSingleConnection(destIP string, port int, sourceAppName string, shouldSucceed bool) {
-	proxyTest := func() (string, error) {
-		respBytes, err := httpGetBytes(fmt.Sprintf("http://%s.%s/proxy/%s:%d", sourceAppName, config.AppsDomain, destIP, port))
-		if err != nil {
-			return "", err
-		}
-		return string(respBytes), nil
-	}
-	if shouldSucceed {
-		By(fmt.Sprintf("eventually proxy should reach %s at port %d", destIP, port))
-		Eventually(proxyTest, 10*time.Second, 500*time.Millisecond).Should(ContainSubstring(`application_name`))
-	} else {
-		By(fmt.Sprintf("eventually proxy should NOT reach %s at port %d", destIP, port))
-		Eventually(proxyTest, 10*time.Second, 500*time.Millisecond).Should(ContainSubstring("request failed"))
-	}
-}
-
 var httpClient = &http.Client{
 	Transport: &http.Transport{
 		DisableKeepAlives: true,
@@ -359,4 +210,18 @@ func httpGetBytes(url string) ([]byte, error) {
 		return nil, err
 	}
 	return respBytes, nil
+}
+
+func GetVMCPUUsage() string {
+	cmd := exec.Command("bosh", "vms", "--vitals")
+	output, err := cmd.Output()
+	Expect(err).NotTo(HaveOccurred())
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "cell") {
+			return line
+		}
+	}
+	return ""
 }
